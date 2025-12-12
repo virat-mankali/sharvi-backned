@@ -1,0 +1,19 @@
+# FastAPI and server
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+python-dotenv>=1.0.0
+
+# LangChain and LangGraph
+langchain>=0.3.14
+langchain-openai>=0.2.14
+langgraph>=0.2.60
+
+# Database - use latest psycopg3 with binary for Python 3.14 compatibility
+supabase>=2.11.0
+psycopg[binary]>=3.2.10
+
+# Data processing
+pandas>=2.2.0
+
+# Utilities
+pydantic>=2.10.0
