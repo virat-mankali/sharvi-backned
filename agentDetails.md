@@ -1,129 +1,251 @@
-This is a critical update. Handling **20 million rows** changes the architecture from "simple script" to "enterprise engineering." If you try to load 20 million rows into Python memory (Pandas), your Render instance will crash immediately.
+# Veda AI - Cursor-Style Data Analyst Agent
 
-Here is the updated, highly technical prompt for Kiro. It includes the logic for **Server-Side Aggregation** (for charts) and **Stream-to-Storage** (for exports).
+## Overview
 
------
+Veda AI is a streaming data analyst agent that works like Cursor AI but for data analysis instead of coding. It analyzes machine production data from a PostgreSQL database with ~20 million rows, streaming its reasoning, SQL queries, and insights in real-time.
 
-### Latest Update: Error Recovery & Intelligent Retry System
+## Key Features
 
-The agent now includes:
+### 🎯 Cursor-Style Streaming
+- Real-time token streaming as the AI thinks
+- Visible reasoning process ("I'll query the database to find...")
+- SQL queries shown before execution
+- Progress updates during tool execution
+- Results streamed as they arrive
 
-1. **Error Memory**: Tracks all failed SQL attempts with error analysis
-2. **SQL Validation**: Validates queries using EXPLAIN before execution
-3. **Intelligent Retry**: Up to 3 retries with learning from past failures
-4. **Auto-Export Detection**: Automatically routes complex queries (ranking, all machines, criticality scoring) to CSV export
-5. **Server-Side Calculations**: All scoring/ranking done in SQL, not Python
+### 🔄 ReAct Loop
+The agent follows a Reason-Act-Observe loop:
+1. **Reason**: Understand the question, plan the approach
+2. **Act**: Execute SQL queries or export data
+3. **Observe**: Analyze results, decide if more queries needed
+4. **Repeat**: Continue until the answer is complete
 
-**Key Features:**
-- `error_history`: List of `{sql, error, analysis}` for each failed attempt
-- `validate_sql_syntax()`: Pre-execution validation using EXPLAIN
-- `analyze_sql_error()`: Provides guidance for retry based on error type
-- `requires_export`: Auto-detects queries needing CSV export (ranking, all machines, etc.)
+### 📊 Automatic Visualizations
+- Bar charts for comparisons
+- Line charts for time series
+- Pie charts for distributions
+- Automatic chart type selection based on data
 
-**Flow for Complex Queries (e.g., "rank all machines by criticality"):**
-1. Intent classified as "analysis"
-2. `requires_export` flag set to `True` (detected keywords: rank, all machines, criticality)
-3. SQL generated with server-side scoring calculation
-4. SQL validated with EXPLAIN
-5. If valid → exported to CSV → signed URL returned
-6. If invalid → error recorded → retry with error context → repeat up to 3 times
+### 📥 CSV Export
+- Large dataset export to Supabase Storage
+- Signed download URLs (1 hour expiry)
+- Server-side cursor for memory efficiency
 
------
+## Architecture
 
------
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Frontend (Next.js)                      │
+│  - SSE event listener                                        │
+│  - Real-time message rendering                               │
+│  - Chart.js visualizations                                   │
+│  - Download handling                                         │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              │ POST /chat/stream (SSE)
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    FastAPI Server                            │
+│  - SSE streaming endpoint                                    │
+│  - Event formatting                                          │
+│  - Error handling                                            │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  LangGraph ReAct Agent                       │
+│  ┌─────────┐    ┌─────────┐    ┌─────────┐                  │
+│  │  Agent  │───▶│  Tools  │───▶│  Agent  │──▶ ...           │
+│  │ (Think) │    │ (Query) │    │(Analyze)│                  │
+│  └─────────┘    └─────────┘    └─────────┘                  │
+│                                                              │
+│  Stream Modes: messages, updates, custom                     │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Tools Layer                               │
+│  - run_sql_query: Execute SQL, return max 100 rows          │
+│  - export_to_csv: Export to Supabase Storage                │
+│  - get_stream_writer: Send progress updates                 │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                 Supabase (PostgreSQL)                        │
+│  - Table: "General Machine 2000"                            │
+│  - ~20 million rows                                          │
+│  - Storage bucket for CSV exports                           │
+└─────────────────────────────────────────────────────────────┘
+```
 
-### The Prompt for Kiro (Copy & Paste this)
+## Streaming Event Types
 
-**Role:**
-You are a Lead Data Engineer and AI Architect.
+The `/chat/stream` endpoint sends these SSE events:
 
-**Goal:**
-Build a production-grade **FastAPI backend** containing a **LangGraph Agent** responsible for analyzing and exporting large-scale data (20 million rows) from **Supabase**.
+| Event Type | Description | Data |
+|------------|-------------|------|
+| `start` | Processing started | `{message, timestamp}` |
+| `thinking` | Agent reasoning | `{content}` |
+| `tool_call` | Tool being invoked | `{tool, args}` |
+| `tool_start` | Tool execution starting | `{tool, message, sql}` |
+| `tool_result` | Tool completed | `{tool, message, row_count, preview}` |
+| `tool_error` | Tool failed | `{message}` |
+| `token` | LLM token | `{content, node}` |
+| `message` | Complete message chunk | `{content, node}` |
+| `data_received` | Query results | `{row_count, preview}` |
+| `visualization` | Chart data ready | `{data}` |
+| `download` | CSV URL ready | `{url, row_count}` |
+| `done` | Agent finished | `{answer, visualization, download_url}` |
+| `error` | Error occurred | `{message}` |
 
-**The Stack:**
+## API Endpoints
 
-  * **Backend:** Python (FastAPI) hosted on Render.
-  * **Orchestrator:** LangGraph + LangChain.
-  * **Database:** Supabase (PostgreSQL).
-  * **Frontend:** Next.js (You are providing the API for this).
+### POST /chat/stream
+Streaming endpoint with Server-Sent Events.
 
-**Critical Constraints (Scale & Performance):**
+```javascript
+const eventSource = new EventSource('/chat/stream', {
+  method: 'POST',
+  body: JSON.stringify({ query: "What's the best machine?", thread_id: "session-1" })
+});
 
-1.  **Volume:** The production DB has **20 million rows**.
-2.  **No `SELECT *`:** The agent must **never** pull all raw rows into memory for analysis. It must use SQL aggregations (`SUM`, `COUNT`, `AVG`, `GROUP BY`) to reduce data *before* fetching it into Python.
-3.  **Memory Safety:** Large exports must be streamed, not loaded into RAM.
+eventSource.onmessage = (event) => {
+  if (event.data === '[DONE]') {
+    eventSource.close();
+    return;
+  }
+  const data = JSON.parse(event.data);
+  // Handle different event types
+  switch (data.type) {
+    case 'token':
+      appendToMessage(data.content);
+      break;
+    case 'visualization':
+      renderChart(data.data);
+      break;
+    // ... etc
+  }
+};
+```
 
------
+### POST /chat
+Non-streaming endpoint for simple requests.
 
-### Agent Architecture & Workflow
+```json
+Request: { "query": "What's the best machine?", "thread_id": "session-1" }
+Response: {
+  "answer": "Based on the data...",
+  "visualization": { "type": "bar", "labels": [...], "datasets": [...] },
+  "download_url": null,
+  "error": null
+}
+```
 
-Create a `StateGraph` with a conditional entry point that classifies the user intent into one of two flows: **(A) Analysis/Visuals** or **(B) Data Export**.
+### GET /health
+Health check endpoint.
 
-#### Flow A: Analysis & Visualization (The "Chat" Flow)
+## Environment Variables
 
-  * **Goal:** Answer questions and provide data for frontend charts.
-  * **Node Logic:**
-    1.  **SQL Generator:** Converts user questions into SQL. *Strict Rule:* Must use aggregations. If the user asks for "Trend of sales," generate `SELECT date, SUM(amount)...`, not raw rows.
-    2.  **Validator:** Checks if the query returns \> 100 rows. If so, refine the query to limit/group data.
-    3.  **Formatter:** Instead of returning Markdown, return a **Structured JSON** object that the frontend can use to render Recharts/Chart.js.
-    <!-- end list -->
-      * *Output Schema:*
-        ```json
-        {
-          "answer": "Sales peaked in Q3...",
-          "visualization": {
-            "type": "bar", // or line, pie
-            "labels": ["Q1", "Q2", "Q3"],
-            "datasets": [{ "label": "Sales", "data": [100, 150, 300] }]
+```env
+# Required
+OPENAI_API_KEY=sk-...
+SUPABASE_URL=https://xxx.supabase.co
+SUPABASE_KEY=eyJ...
+
+# Optional
+OPENAI_MODEL=gpt-4o          # or gpt-4o-mini for faster/cheaper
+DATABASE_URL=postgresql://...  # Direct connection string
+SUPABASE_DB_PASSWORD=...       # For building connection string
+```
+
+## Running Locally
+
+```bash
+cd backend
+pip install -r requirements.txt
+uvicorn server:app --reload --port 8000
+```
+
+## Frontend Integration Example
+
+```typescript
+// React hook for streaming chat
+function useStreamingChat() {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [isStreaming, setIsStreaming] = useState(false);
+
+  const sendMessage = async (query: string) => {
+    setIsStreaming(true);
+    
+    const response = await fetch('/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, thread_id: 'session-1' })
+    });
+
+    const reader = response.body?.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader!.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value);
+      const lines = chunk.split('\n');
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const data = line.slice(6);
+          if (data === '[DONE]') {
+            setIsStreaming(false);
+            return;
           }
+          
+          const event = JSON.parse(data);
+          handleEvent(event);
         }
-        ```
+      }
+    }
+  };
 
-#### Flow B: The "CSV Export" Flow (The "Download" Flow)
+  return { messages, sendMessage, isStreaming };
+}
+```
 
-  * **Goal:** Allow users to download large datasets (e.g., "Give me all 50k transactions from NYC") without crashing the browser or server.
-  * **Node Logic:**
-    1.  **SQL Generator:** Generate the filtering query (e.g., `SELECT * FROM sales WHERE city = 'NYC'`).
-    2.  **Stream-to-Storage Tool:**
-          * **Do not** return this data to the chat.
-          * Execute the query using a **Server-Side Cursor** (stream results in chunks).
-          * Write chunks to a CSV buffer.
-          * Upload the stream directly to a **Supabase Storage Bucket** (e.g., `exports`).
-          * Generate a **Signed URL** (valid for 1 hour).
-    3.  **Final Output:** Return a message: "I've prepared your dataset. You can download it here: [Link]."
+## Design Decisions
 
------
+### Why Streaming?
+- Users see progress immediately (no waiting for complete response)
+- Transparent reasoning builds trust
+- SQL queries visible before execution
+- Better UX for long-running analyses
 
-### Technical Implementation Requirements
+### Why ReAct Pattern?
+- Natural reasoning flow (think → act → observe)
+- Can handle complex multi-step queries
+- Self-correcting (can retry failed queries)
+- Extensible (easy to add new tools)
 
-**1. The Tools (`tools.py`)**
+### Why Multiple Stream Modes?
+- `messages`: Token-by-token LLM output
+- `updates`: Node completion events
+- `custom`: Tool progress updates
+- Combined for rich real-time experience
 
-  * `query_aggregate_data`: For Flow A. Fetches small, aggregated dataframes.
-  * `export_large_dataset`: For Flow B. Uses `cursor.fetchmany(size=1000)` loops to write to a file-like object and upload to Supabase Storage (`supabase.storage.from_('exports').upload(...)`).
+## Troubleshooting
 
-**2. The Graph (`agent.py`)**
+### Streaming not working
+- Check CORS settings
+- Ensure `X-Accel-Buffering: no` header is set
+- Verify SSE content type: `text/event-stream`
 
-  * Use a Pydantic model for the output structure so the frontend always receives consistent JSON.
+### SQL errors
+- Table name must be quoted: `"General Machine 2000"`
+- Check column names match schema
+- Use COALESCE for NULL handling
 
-**3. The API (`server.py`)**
-
-  * Endpoint: `POST /agent/analyze`
-  * Input: `{"query": "Show me sales by region", "thread_id": "123"}`
-  * Output: The structured JSON described in Flow A.
-
-**4. Environment Variables**
-
-  * Ensure the code uses `os.getenv` for: `SUPABASE_URL`, `SUPABASE_KEY`, `OPENAI_API_KEY`.
-
-**Deliverables:**
-
-  * Complete code for `agent.py` (Graph definition), `tools.py` (Supabase interaction), and `server.py` (FastAPI).
-  * A specific System Prompt for the LLM instructing it on when to choose Bar vs Pie vs Line charts based on data types (e.g., "Use Line charts for time-series data").
-
------
-
-### Why this prompt works for you:
-
-1.  **Prevents Crashing:** By explicitly forbidding `SELECT *` for analysis and enforcing "Stream-to-Storage" for exports, you solve the 20 million row problem.
-2.  **Frontend Ready:** It forces the agent to return JSON for charts, meaning you can easily use libraries like **Recharts** or **Tremor** in Next.js to make it look professional, rather than just displaying text.
-3.  **Scalable:** The "Cursor" logic ensures that even if you export 1 million rows, your Python memory usage remains low.
+### Slow responses
+- Use `gpt-4o-mini` for faster responses
+- Add appropriate LIMIT clauses
+- Use aggregations instead of raw data

@@ -1,79 +1,186 @@
-The Prompt for Kiro (Copy & Paste this)
-Role: You are a Senior Python Backend Engineer specializing in AI Agents, LangGraph, and Data Analytics.
+# Sharvi AI - Cursor-Style Data Analyst Agent
 
-Goal: Create a robust FastAPI backend that hosts a LangGraph Data Analyst Agent. This backend will be hosted on Render and must expose a REST API for my Next.js frontend to consume.
+## What This Agent Does
 
-The Context: I have a database hosted on Supabase. The agent needs to answer user questions by converting natural language into SQL, querying the database, analyzing the results using Pandas, and returning a helpful insight.
+Sharvi AI is a streaming data analyst agent that works like Cursor AI IDE, but instead of helping with code, it helps analyze machine production data. It:
 
-Tech Stack Requirements:
+1. **Streams reasoning in real-time** - Shows its thought process as it works
+2. **Executes SQL queries** - Converts natural language to PostgreSQL
+3. **Provides visualizations** - Auto-generates charts when relevant
+4. **Exports large datasets** - Creates downloadable CSV files
 
-Framework: FastAPI
+## Tech Stack
 
-Agent Orchestration: LangGraph & LangChain
+- **Backend**: FastAPI (Python)
+- **Agent Framework**: LangGraph ReAct Agent
+- **LLM**: GPT-4o (streaming enabled)
+- **Database**: Supabase (PostgreSQL, ~20M rows)
+- **Frontend**: Next.js with SSE streaming
 
-LLM: ChatOpenAI (gpt-4o or gpt-4-turbo)
+## How Streaming Works
 
-Database: supabase-py (or psycopg2 via SQLAlchemy for SQL generation)
+The agent uses LangGraph's multi-mode streaming:
 
-Data Processing: Pandas
+```python
+async for stream_type, chunk in agent.astream(
+    {"messages": [HumanMessage(content=query)]},
+    config=config,
+    stream_mode=["messages", "updates", "custom"]
+):
+    # messages: Token-by-token LLM output
+    # updates: Node completion events  
+    # custom: Tool progress updates (via get_stream_writer)
+```
 
-Detailed Agent Workflow (The "Graph"): Please implement a StateGraph with the following Nodes and logic:
+### Stream Modes Explained
 
-State Definition: A typed dictionary containing messages (chat history) and data_context (to hold retrieved SQL results).
+1. **messages** - Streams individual tokens as the LLM generates text
+2. **updates** - Streams when nodes complete (agent thinking, tool execution)
+3. **custom** - Streams custom data from inside tools using `get_stream_writer()`
 
-Node 1: Schema Loader: A tool or step that understands the database structure (tables and columns) so the LLM knows what to query.
+## ReAct Loop
 
-Node 2: SQL Generator: The agent interprets the user's question and writes a valid SQL query for Supabase (PostgreSQL).
+The agent follows Reason-Act-Observe:
 
-Node 3: SQL Executor: A tool that executes the SQL query against Supabase and returns the raw data.
+```
+User: "What's the best performing machine?"
+     │
+     ▼
+┌─────────────────────────────────────────┐
+│ REASON: "I need to find the machine     │
+│ with highest total production"          │
+└─────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────┐
+│ ACT: run_sql_query(                     │
+│   "SELECT machine_name, SUM(qty)..."    │
+│ )                                       │
+└─────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────┐
+│ OBSERVE: Got results:                   │
+│ [{"machine_name": "Alpha", "total": 7201}]│
+└─────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────┐
+│ RESPOND: "Machine Alpha is your top     │
+│ performer with 7,201 total units"       │
+└─────────────────────────────────────────┘
+```
 
-Constraint: Handle empty results or SQL errors gracefully (allow the agent to retry if the SQL fails).
+## Tools
 
-Node 4: Data Analyst: Takes the raw data (convert it to a Pandas DataFrame internally) and generates a natural language answer/insight based on the user's question.
+### run_sql_query
+Executes SQL and returns up to **25 rows maximum**. Streams progress via `get_stream_writer()`.
 
-API Endpoints Required:
+**IMPORTANT RULES:**
+1. **Row Limit**: Always use `LIMIT 25` or less in queries. Never return more than 25 rows.
+2. **Decimal Formatting**: Round all decimal numbers to maximum 3 decimal places. Use `ROUND(column, 3)` in SQL.
+3. **Zero Values**: If a value is 0 or very close to 0, display it as `0` not `0.000000000000`.
 
-POST /chat: Accepts a JSON body {"query": "User question", "thread_id": "optional-session-id"}. It should run the graph and return the final agent response.
+```python
+@tool
+def run_sql_query(sql: str) -> str:
+    writer = get_stream_writer()
+    writer({"type": "tool_start", "sql": sql})
+    # ... execute query ...
+    writer({"type": "tool_result", "row_count": len(data)})
+    return json.dumps({"data": data})
+```
 
-GET /health: A simple health check returning {"status": "ok"}.
+**Example SQL with proper formatting:**
+```sql
+SELECT 
+    machine_name,
+    ROUND(AVG(rpm), 3) AS avg_rpm,
+    ROUND(AVG(power_load_kw), 3) AS avg_power,
+    ROUND(AVG(vibration_mm_per_s), 3) AS avg_vibration
+FROM "General Machine 2000"
+GROUP BY machine_name
+ORDER BY avg_rpm DESC
+LIMIT 25;
+```
 
-Environment Variables: Please set up the code to load these from a .env file:
+### export_to_csv
+Exports large datasets to Supabase Storage with signed download URL. Use this when user needs more than 25 rows.
 
-OPENAI_API_KEY
+**File Naming**: The agent provides a descriptive filename based on the request (e.g., "Overheating_Machines_by_Rank", "Top_Producers_by_Output").
 
-SUPABASE_URL
+## Frontend Integration
 
-SUPABASE_KEY (Service Role or Anon key depending on permissions needed)
+The frontend should:
 
-Deliverables:
+1. **Connect via fetch with streaming**:
+```typescript
+const response = await fetch('/chat/stream', {
+  method: 'POST',
+  body: JSON.stringify({ query, thread_id })
+});
 
-requirements.txt with all dependencies.
+const reader = response.body.getReader();
+// Read SSE events...
+```
 
-agent.py: The logic containing the LangGraph definition, tools, and nodes.
+2. **Handle event types**:
+- `token` → Append to current message
+- `thinking` → Show reasoning indicator
+- `tool_start` → Show SQL being executed
+- `visualization` → Render chart
+- `download` → Show download button
+- `done` → Mark complete
 
-server.py: The FastAPI app setup.
+3. **Render progressively**:
+- Show tokens as they arrive (like Cursor)
+- Display SQL queries in code blocks
+- Auto-render charts when data arrives
 
-Include comments explaining how to run it locally (uvicorn server:app --reload).
-
-Here is the SQL schema of the tables in my Supabase database:
+## Database Schema
 
 ```sql
--- Table: "General Machine 2000"
--- Description: Machine production and sensor data
-CREATE TABLE "General Machine 2000" (
-    id INTEGER PRIMARY KEY,              -- Auto-incrementing ID
-    machine_id TEXT,                     -- Unique machine identifier
-    machine_name TEXT,                   -- Human-readable machine name
-    order_number TEXT,                   -- Production order number
-    product_name TEXT,                   -- Name of product being manufactured
-    qty NUMERIC,                         -- Quantity produced
-    date TEXT,                           -- Production date
-    temperature_celsius NUMERIC,         -- Machine temperature in Celsius
-    humidity_percent NUMERIC,            -- Ambient humidity percentage
-    speed_m_per_min NUMERIC,             -- Machine speed in meters per minute
-    vibration_mm_per_s NUMERIC,          -- Vibration measurement in mm/s
-    rpm INTEGER,                         -- Rotations per minute
-    pressure_bar NUMERIC,                -- Pressure in bar
-    power_load_kw NUMERIC                -- Power consumption in kilowatts
-);
+Table: "General Machine 2000"
+
+Columns:
+- machine_id (TEXT)
+- machine_name (TEXT)
+- qty (NUMERIC)
+- date (TEXT)
+- temperature_celsius (NUMERIC)
+- humidity_percent (NUMERIC)
+- speed_m_per_min (NUMERIC)
+- vibration_mm_per_s (NUMERIC)
+- rpm (INTEGER)
+- pressure_bar (NUMERIC)
+- power_load_kw (NUMERIC)
+- order_number (TEXT)
+- product_name (TEXT)
 ```
+
+## Environment Variables
+
+```env
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o
+SUPABASE_URL=https://xxx.supabase.co
+SUPABASE_KEY=eyJ...
+DATABASE_URL=postgresql://...
+```
+
+## Running
+
+```bash
+cd backend
+pip install -r requirements.txt
+uvicorn server:app --reload --port 8000
+```
+
+## Example Queries
+
+- "What's the best performing machine?"
+- "Show me production trends over the last month"
+- "Compare machine efficiency by power consumption"
+- "Export all data for Machine Alpha to CSV"
+- "Which machines have the highest vibration levels?"
+- "What's the average temperature across all machines?"

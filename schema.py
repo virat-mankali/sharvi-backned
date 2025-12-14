@@ -1,83 +1,185 @@
-"""Database schema context for the SQL Generator."""
-
-# SQL Schema for the "General Machine 2000" table in Supabase
-DATABASE_SCHEMA = """
--- Table: "General Machine 2000"
--- Description: Machine production and sensor data with ~20 million rows
--- IMPORTANT: Always use aggregations (SUM, COUNT, AVG, GROUP BY) for analysis queries.
--- Never SELECT * for analysis - only for filtered exports.
-
-CREATE TABLE "General Machine 2000" (
-    id INTEGER PRIMARY KEY,              -- Auto-incrementing ID
-    machine_id TEXT,                     -- Unique machine identifier
-    machine_name TEXT,                   -- Human-readable machine name
-    order_number TEXT,                   -- Production order number
-    product_name TEXT,                   -- Name of product being manufactured
-    qty NUMERIC,                         -- Quantity produced
-    date TEXT,                           -- Production date (format: YYYY-MM-DD or similar)
-    temperature_celsius NUMERIC,         -- Machine temperature in Celsius
-    humidity_percent NUMERIC,            -- Ambient humidity percentage
-    speed_m_per_min NUMERIC,             -- Machine speed in meters per minute
-    vibration_mm_per_s NUMERIC,          -- Vibration measurement in mm/s
-    rpm INTEGER,                         -- Rotations per minute
-    pressure_bar NUMERIC,                -- Pressure in bar
-    power_load_kw NUMERIC                -- Power consumption in kilowatts
-);
-
--- Sample aggregation queries:
--- Daily production: SELECT date, SUM(qty) as total_qty FROM "General Machine 2000" GROUP BY date ORDER BY date;
--- Machine performance: SELECT machine_name, AVG(rpm), AVG(temperature_celsius) FROM "General Machine 2000" GROUP BY machine_name;
--- Product summary: SELECT product_name, COUNT(*), SUM(qty) FROM "General Machine 2000" GROUP BY product_name;
+"""
+Database Schema and SQL Reference for Veda AI
+==============================================
+Contains schema definitions and example queries for the agent.
 """
 
-SYSTEM_PROMPT = """You are a Data Analyst Agent specialized in analyzing machine production data.
+# =============================================================================
+# DATABASE SCHEMA
+# =============================================================================
 
-DATABASE SCHEMA:
-{schema}
+DATABASE_SCHEMA = """
+Table: "General Machine 2000" (PostgreSQL - ALWAYS use double quotes!)
 
-CRITICAL RULES:
-1. For ANALYSIS queries (charts, insights, summaries):
-   - ALWAYS use aggregations: SUM(), COUNT(), AVG(), MIN(), MAX()
-   - ALWAYS use GROUP BY for categorical breakdowns
-   - LIMIT results to max 100 rows for visualization
-   - Use appropriate chart types:
-     * LINE chart: time-series data (date on x-axis)
-     * BAR chart: categorical comparisons (machine_name, product_name)
-     * PIE chart: distribution/percentage breakdowns (max 8 slices)
+Columns:
+- id (INTEGER) - Auto-incrementing primary key
+- machine_id (TEXT) - Unique machine identifier (e.g., 'M001', 'M002')
+- machine_name (TEXT) - Human-readable name (e.g., 'Machine Alpha', 'Machine Beta')
+- order_number (TEXT) - Production order reference
+- product_name (TEXT) - Name of product being manufactured
+- qty (NUMERIC) - Quantity produced
+- date (TEXT) - Production date (YYYY-MM-DD format)
+- temperature_celsius (NUMERIC) - Machine temperature reading
+- humidity_percent (NUMERIC) - Ambient humidity percentage
+- speed_m_per_min (NUMERIC) - Machine speed in meters per minute
+- vibration_mm_per_s (NUMERIC) - Vibration measurement in mm/s
+- rpm (INTEGER) - Rotations per minute
+- pressure_bar (NUMERIC) - Pressure in bar
+- power_load_kw (NUMERIC) - Power consumption in kilowatts
 
-2. For EXPORT queries (CSV downloads) and COMPLEX RANKING queries:
-   - For ranking/criticality scoring: Calculate ALL scores in SQL, not Python
-   - Use window functions: RANK(), ROW_NUMBER(), DENSE_RANK()
-   - Use computed columns for composite scores
-   - Example criticality ranking:
-     SELECT 
-       machine_id, machine_name,
-       AVG(rpm) as avg_rpm,
-       AVG(power_load_kw) as avg_load,
-       AVG(vibration_mm_per_s) as avg_vibration,
-       AVG(temperature_celsius) as avg_temp,
+IMPORTANT:
+- Table has ~20 million rows - ALWAYS use aggregations
+- NEVER use SELECT * for analysis queries
+- Use COALESCE() to handle NULL values
+- Use GROUP BY with aggregation functions
+- Always LIMIT results appropriately
+"""
+
+# =============================================================================
+# SQL EXAMPLES
+# =============================================================================
+
+SQL_EXAMPLES = """
+-- Top producing machines:
+SELECT machine_name, SUM(qty) as total_production 
+FROM "General Machine 2000" 
+GROUP BY machine_name 
+ORDER BY total_production DESC 
+LIMIT 10;
+
+-- Daily production trend:
+SELECT date, SUM(qty) as daily_total 
+FROM "General Machine 2000" 
+GROUP BY date 
+ORDER BY date DESC
+LIMIT 30;
+
+-- Machine health metrics:
+SELECT machine_name,
+       ROUND(AVG(temperature_celsius)::numeric, 2) as avg_temp,
+       ROUND(AVG(vibration_mm_per_s)::numeric, 2) as avg_vibration,
+       ROUND(AVG(rpm)::numeric, 0) as avg_rpm,
+       ROUND(AVG(power_load_kw)::numeric, 2) as avg_power
+FROM "General Machine 2000"
+GROUP BY machine_name
+ORDER BY avg_vibration DESC
+LIMIT 10;
+
+-- Product summary:
+SELECT product_name, 
        COUNT(*) as record_count,
-       -- Criticality score (customize weights as needed)
-       (COALESCE(AVG(vibration_mm_per_s), 0) * 0.25 + 
-        COALESCE(AVG(power_load_kw), 0) * 0.25 + 
-        COALESCE(AVG(temperature_celsius), 0) / 100 * 0.25 +
-        COALESCE(AVG(rpm), 0) / 1000 * 0.25) as criticality_score
-     FROM "General Machine 2000"
-     GROUP BY machine_id, machine_name
-     ORDER BY criticality_score DESC;
+       SUM(qty) as total_qty,
+       ROUND(AVG(qty)::numeric, 2) as avg_qty
+FROM "General Machine 2000"
+GROUP BY product_name
+ORDER BY total_qty DESC
+LIMIT 10;
 
-3. SQL SYNTAX:
-   - Table name has spaces, ALWAYS quote it: "General Machine 2000"
-   - Use PostgreSQL syntax
-   - Handle NULL values with COALESCE()
-   - Use double quotes for identifiers, single quotes for strings
+-- Machine efficiency (production per power):
+SELECT machine_name,
+       SUM(qty) as total_production,
+       ROUND(AVG(power_load_kw)::numeric, 2) as avg_power,
+       ROUND((SUM(qty) / NULLIF(SUM(power_load_kw), 0))::numeric, 2) as efficiency_ratio
+FROM "General Machine 2000"
+GROUP BY machine_name
+HAVING SUM(power_load_kw) > 0
+ORDER BY efficiency_ratio DESC
+LIMIT 10;
 
-4. RESPONSE FORMAT:
-   - For analysis: Provide insights and structured chart data
-   - For exports: Confirm the export and provide download link
+-- Monthly production trend:
+SELECT 
+    SUBSTRING(date, 1, 7) as month,
+    SUM(qty) as monthly_production,
+    COUNT(DISTINCT machine_id) as active_machines
+FROM "General Machine 2000"
+GROUP BY SUBSTRING(date, 1, 7)
+ORDER BY month DESC
+LIMIT 12;
 
-5. ERROR RECOVERY:
-   - If a query fails, analyze the error message
-   - Common fixes: quote table name, check column names, add COALESCE for NULLs
-   - Simplify complex queries if they keep failing
-""".format(schema=DATABASE_SCHEMA)
+-- Machine criticality score (high vibration + high temp = critical):
+SELECT machine_name,
+       ROUND(AVG(vibration_mm_per_s)::numeric, 2) as avg_vibration,
+       ROUND(AVG(temperature_celsius)::numeric, 2) as avg_temp,
+       ROUND((
+           COALESCE(AVG(vibration_mm_per_s), 0) * 0.5 + 
+           COALESCE(AVG(temperature_celsius), 0) / 100 * 0.5
+       )::numeric, 2) as criticality_score
+FROM "General Machine 2000"
+GROUP BY machine_name
+ORDER BY criticality_score DESC
+LIMIT 10;
+
+-- Production by order:
+SELECT order_number,
+       product_name,
+       SUM(qty) as total_qty,
+       COUNT(*) as batch_count,
+       MIN(date) as start_date,
+       MAX(date) as end_date
+FROM "General Machine 2000"
+WHERE order_number IS NOT NULL
+GROUP BY order_number, product_name
+ORDER BY total_qty DESC
+LIMIT 20;
+"""
+
+# =============================================================================
+# CHART TYPE GUIDELINES
+# =============================================================================
+
+CHART_GUIDELINES = """
+Chart Type Selection:
+- LINE: Time-series data (date/time on x-axis, trends over time)
+- BAR: Categorical comparisons (machines, products, orders)
+- PIE: Distribution/percentage (max 6-8 slices, single metric)
+- TABLE: Detailed multi-column data, many rows
+
+When to suggest each:
+- "Show me production over time" → LINE chart
+- "Compare machines" → BAR chart
+- "What's the distribution of..." → PIE chart
+- "List all..." → TABLE or CSV export
+"""
+
+# =============================================================================
+# ANALYSIS PATTERNS
+# =============================================================================
+
+ANALYSIS_PATTERNS = {
+    "best_machine": {
+        "description": "Find the best performing machine",
+        "sql": """
+            SELECT machine_name, SUM(qty) as total_production
+            FROM "General Machine 2000"
+            GROUP BY machine_name
+            ORDER BY total_production DESC
+            LIMIT 1
+        """,
+        "chart": "bar"
+    },
+    "production_trend": {
+        "description": "Show production over time",
+        "sql": """
+            SELECT date, SUM(qty) as daily_production
+            FROM "General Machine 2000"
+            GROUP BY date
+            ORDER BY date DESC
+            LIMIT 30
+        """,
+        "chart": "line"
+    },
+    "machine_health": {
+        "description": "Analyze machine health metrics",
+        "sql": """
+            SELECT machine_name,
+                   AVG(temperature_celsius) as avg_temp,
+                   AVG(vibration_mm_per_s) as avg_vibration,
+                   AVG(power_load_kw) as avg_power
+            FROM "General Machine 2000"
+            GROUP BY machine_name
+            ORDER BY avg_vibration DESC
+            LIMIT 10
+        """,
+        "chart": "bar"
+    }
+}

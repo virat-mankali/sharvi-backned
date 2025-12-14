@@ -1,867 +1,569 @@
-"""LangGraph Agent for Data Analysis with memory, conditional routing, and error recovery."""
+"""
+Sharvi AI - Data Analyst Agent (Cursor-style streaming)
+=======================================================
+A ReAct agent that streams its reasoning, SQL queries, and analysis in real-time.
+Designed to feel like Cursor AI but for data analysis instead of coding.
+"""
 import os
 import json
-from typing import Literal, Dict, Any, List, Annotated
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
-from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.types import RetryPolicy
-from typing_extensions import TypedDict
+import re
+from typing import Dict, Any, List, Optional, AsyncGenerator
+from datetime import datetime
 
-from schema import SYSTEM_PROMPT, DATABASE_SCHEMA
+from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.config import get_stream_writer
+
 from tools import query_aggregate_data, export_large_dataset, validate_sql_syntax
 
 
-# Initialize LLM
-def get_llm():
-    return ChatOpenAI(
-        model="gpt-4o-mini",
+# =============================================================================
+# SYSTEM PROMPT - Smart, concise, only use tools when needed
+# =============================================================================
+SYSTEM_PROMPT = """You are Sharvi AI, a friendly data analyst assistant for machine production data.
+
+## CRITICAL: RESPONSE LENGTH LIMIT
+- **Maximum response: 2000 tokens** - Be concise!
+- Answer directly and to the point
+- Only elaborate if user explicitly asks for more detail
+- No unnecessary explanations or filler text
+
+## CRITICAL: WHEN TO USE TOOLS
+- ONLY use tools when the user asks for actual data analysis
+- For greetings (hi, hello, hey, etc.) - just respond naturally, NO tools needed
+- For general questions about what you can do - just explain briefly, NO tools needed
+- For data questions (best machine, trends, comparisons, exports) - USE tools
+
+## RESPONSE FORMATTING (Use Markdown)
+Format your responses to be easy to read:
+- Use **bold** for key values and machine names
+- Use bullet points for lists
+- Use tables for comparing multiple items (keep tables small, max 10 rows)
+- Keep paragraphs short (2-3 sentences max)
+- Add emoji sparingly for visual appeal (📊 for data, 🏆 for top performers, etc.)
+
+## RESPONSE STYLE
+- Be CONCISE - get to the point quickly
+- For greetings: Short friendly response (1-2 sentences max)
+- For data analysis: Lead with the key insight, then supporting details
+- Never show SQL to users unless they ask
+- Never list example queries unless asked
+- Don't over-explain - trust the user understands
+
+## WHEN ANALYZING DATA
+1. Run the query (don't announce it beforehand)
+2. Present findings concisely:
+   - Lead with the key insight/answer in 1-2 sentences
+   - Use a small table or bullet list for details (max 10 items)
+   - Format numbers nicely (7,201.19 not 7201.19)
+3. Brief context only if needed
+
+## EXAMPLE GOOD RESPONSE FORMAT
+"🏆 **Machine Alpha** is your top performer with **7,201 units** produced.
+
+| Rank | Machine | Production |
+|------|---------|------------|
+| 1 | Machine Alpha | 7,201 |
+| 2 | Machine Beta | 5,432 |
+
+📊 Chart included above."
+
+## DATABASE
+Table: "General Machine 2000" (~20M rows)
+Columns: machine_id, machine_name, qty, date, temperature_celsius, humidity_percent, speed_m_per_min, vibration_mm_per_s, rpm, pressure_bar, power_load_kw, order_number, product_name
+
+## SQL RULES
+- Quote table: FROM "General Machine 2000"
+- Use COALESCE for NULLs
+- Always use aggregations (never SELECT *)
+- **LIMIT results to 25 rows maximum** (use LIMIT 10-25)
+- **ROUND all decimals to 3 places max**: ROUND(column, 3)
+- If value is 0 or near 0, display as 0 (not 0.000000000000)
+
+## DECIMAL FORMATTING EXAMPLE
+```sql
+SELECT 
+    machine_name,
+    ROUND(AVG(rpm), 3) AS avg_rpm,
+    ROUND(AVG(power_load_kw), 3) AS avg_power
+FROM "General Machine 2000"
+GROUP BY machine_name
+LIMIT 25;
+```
+
+## CSV EXPORT FILE NAMING
+When using export_to_csv, provide a descriptive filename based on the request:
+- "Overheating Machines by Rank" for temperature analysis
+- "Top Producers by Output" for production data
+- "High Vibration Machines" for vibration analysis
+- Use clear, descriptive names that reflect the data content
+
+## DATA ACCURACY
+- ONLY report values from tool responses - NEVER make up data
+- If null, say "not recorded"
+- Format numbers with commas
+"""
+
+
+# =============================================================================
+# TOOLS - With streaming progress updates
+# =============================================================================
+
+@tool
+def run_sql_query(sql: str) -> str:
+    """
+    Execute a SQL query to analyze machine production data.
+    
+    Args:
+        sql: PostgreSQL query. Table name MUST be quoted: "General Machine 2000"
+             IMPORTANT: Always use LIMIT 25 or less. Use ROUND(column, 3) for decimals.
+    
+    Returns:
+        JSON with query results (max 25 rows)
+    """
+    writer = get_stream_writer()
+    
+    # Stream: Show the query being executed
+    writer({
+        "type": "tool_start",
+        "tool": "run_sql_query",
+        "message": "Executing SQL query...",
+        "sql": sql
+    })
+    
+    # Validate SQL first
+    validation = validate_sql_syntax(sql)
+    if not validation.get("valid", True) and validation.get("error"):
+        writer({
+            "type": "tool_error",
+            "tool": "run_sql_query", 
+            "message": f"SQL validation failed: {validation['error']}"
+        })
+        return json.dumps({
+            "error": validation["error"],
+            "hint": "Check table name is quoted: \"General Machine 2000\""
+        })
+    
+    # Execute query
+    result = query_aggregate_data(sql)
+    
+    if result.get("error"):
+        writer({
+            "type": "tool_error",
+            "tool": "run_sql_query",
+            "message": f"Query failed: {result['error']}"
+        })
+        return json.dumps({"error": result["error"]})
+    
+    data = result.get("data", [])
+    row_count = len(data)
+    
+    # Stream: Show results summary
+    writer({
+        "type": "tool_result",
+        "tool": "run_sql_query",
+        "message": f"Query returned {row_count} rows",
+        "row_count": row_count,
+        "preview": data[:3] if data else []  # Preview first 3 rows
+    })
+    
+    return json.dumps({
+        "success": True,
+        "row_count": row_count,
+        "data": data,
+        "note": "Use these EXACT values in your response. Report null values as 'not recorded'."
+    }, default=str)
+
+
+@tool
+def export_to_csv(sql: str, filename: str = "", description: str = "") -> str:
+    """
+    Export large dataset to CSV file for download.
+    Use this when the user needs more than 25 rows or wants to download data.
+    
+    Args:
+        sql: PostgreSQL query. Table name MUST be quoted: "General Machine 2000"
+        filename: Descriptive name for the file (e.g., "Overheating Machines by Rank", "Top Producers by Output")
+        description: Brief description of what's being exported
+    
+    Returns:
+        JSON with download URL and filename
+    """
+    writer = get_stream_writer()
+    
+    display_name = filename or description or "data export"
+    
+    writer({
+        "type": "tool_start",
+        "tool": "export_to_csv",
+        "message": f"Preparing CSV export: {display_name}",
+        "sql": sql
+    })
+    
+    # Remove LIMIT for full export
+    clean_sql = re.sub(r'\s+LIMIT\s+\d+\s*;?\s*$', '', sql, flags=re.IGNORECASE)
+    if not clean_sql.strip().endswith(';'):
+        clean_sql = clean_sql.strip() + ';'
+    
+    result = export_large_dataset(clean_sql, custom_filename=filename)
+    
+    if result.get("error"):
+        writer({
+            "type": "tool_error",
+            "tool": "export_to_csv",
+            "message": f"Export failed: {result['error']}"
+        })
+        return json.dumps({"error": result["error"]})
+    
+    writer({
+        "type": "tool_result",
+        "tool": "export_to_csv",
+        "message": f"Exported {result['row_count']:,} rows to CSV",
+        "row_count": result["row_count"],
+        "download_url": result["download_url"],
+        "filename": result.get("filename", "export.csv")
+    })
+    
+    return json.dumps({
+        "success": True,
+        "row_count": result["row_count"],
+        "download_url": result["download_url"],
+        "filename": result.get("filename", "export.csv"),
+        "message": f"Successfully exported {result['row_count']:,} rows"
+    })
+
+
+# =============================================================================
+# AGENT CREATION
+# =============================================================================
+
+def create_agent():
+    """Create the ReAct agent with streaming support."""
+    model_name = os.getenv("OPENAI_MODEL", "gpt-4o")
+    
+    model = ChatOpenAI(
+        model=model_name,
         temperature=0,
+        streaming=True,  # Enable token streaming
         api_key=os.getenv("OPENAI_API_KEY"),
     )
-
-
-# ============== STATE DEFINITION WITH ERROR MEMORY ==============
-
-class AgentState(TypedDict):
-    """State for the LangGraph agent with conversation memory and error tracking."""
-    messages: Annotated[List[BaseMessage], add_messages]  # Conversation history
-    query: str
-    intent: str | None
-    sql_query: str | None
-    query_result: List[Dict[str, Any]] | None
-    final_response: Dict[str, Any] | None
-    error: str | None
-    retry_count: int
-    # Error memory for learning from failures
-    error_history: List[Dict[str, str]] | None  # [{sql, error, analysis}]
-    requires_export: bool | None  # Flag for queries that need CSV export
-
-
-# ============== HELPER FUNCTIONS ==============
-
-def get_conversation_context(messages: List[BaseMessage], max_messages: int = 10) -> str:
-    """Extract recent conversation context for the LLM."""
-    recent = messages[-max_messages:] if len(messages) > max_messages else messages
-    context_parts = []
-    for msg in recent:
-        role = "User" if isinstance(msg, HumanMessage) else "Assistant"
-        context_parts.append(f"{role}: {msg.content}")
-    return "\n".join(context_parts)
-
-
-# ============== NODE FUNCTIONS ==============
-
-def classify_intent(state: AgentState) -> Dict[str, Any]:
-    """Classify user intent: greeting, analysis, export, or followup."""
-    llm = get_llm()
     
-    # Get conversation context
-    context = get_conversation_context(state.get("messages", []))
-
-    classification_prompt = f"""Classify the user's intent into one of four categories:
-
-1. "greeting" - User is saying hello, greeting, asking about themselves, or asking general questions not about data
-   Examples: "Hi", "Hello", "Hey there", "How are you?", "What can you do?", "Help", "What's my name?", "Do you remember me?"
-
-2. "followup" - User is asking a follow-up question about a PREVIOUS response, asking for clarification, or asking HOW/WHY something was done
-   Examples: "How did you calculate that?", "Why did you use those parameters?", "Can you explain the formula?", "What does that score mean?", "How did u calculate the criticality score?", "Explain the methodology", "What weights did you use?", "Why is machine X ranked higher?"
-   IMPORTANT: If the user is asking about something that was just discussed or explained, this is a followup!
-
-3. "analysis" - User wants NEW insights, charts, summaries, trends, comparisons, or answers about the data
-   Examples: "Show me sales by region", "What's the average temperature?", "Trend of production", "Compare machine A vs B"
-
-4. "export" - User wants to download/export raw data as CSV/file
-   Examples: "Download all records from NYC", "Export transactions", "Give me the raw data"
-
-Recent conversation:
-{context}
-
-Current user query: {state['query']}
-
-IMPORTANT: If the user is asking about HOW something was calculated or WHY something was done in a previous response, classify as "followup", NOT "analysis".
-
-Respond with ONLY one word: "greeting", "followup", "analysis", or "export"
-"""
-
-    response = llm.invoke([HumanMessage(content=classification_prompt)])
-    intent = response.content.strip().lower()
-
-    if intent not in ["greeting", "followup", "analysis", "export"]:
-        intent = "analysis"
-
-    return {"intent": intent}
-
-
-def handle_greeting(state: AgentState) -> Dict[str, Any]:
-    """Handle greeting/conversational messages with memory context."""
-    llm = get_llm()
+    tools = [run_sql_query, export_to_csv]
+    memory = InMemorySaver()
     
-    # Get conversation context
-    context = get_conversation_context(state.get("messages", []))
-
-    greeting_prompt = f"""You are Veda AI, a friendly and helpful data analyst assistant for machine production data.
-
-Previous conversation:
-{context}
-
-Current message from user: "{state['query']}"
-
-Respond warmly and helpfully. Remember details from the conversation (like the user's name if they told you).
-You can help them:
-- Analyze machine performance (RPM, temperature, pressure, etc.)
-- Compare machines and find the best/worst performers
-- Show trends over time
-- Generate visualizations (bar charts, line charts, pie charts)
-- Export data to CSV for download
-
-Keep your response concise, friendly, and personal. Reference previous conversation if relevant.
-Don't use markdown formatting.
-"""
-
-    response = llm.invoke([HumanMessage(content=greeting_prompt)])
-    answer = response.content.strip()
-
-    return {
-        "final_response": {
-            "answer": answer,
-            "visualization": None,
-            "error": None,
-        },
-        "messages": [AIMessage(content=answer)],
-    }
-
-
-def handle_followup(state: AgentState) -> Dict[str, Any]:
-    """Handle follow-up questions about previous responses - explain methodology, calculations, etc."""
-    llm = get_llm()
-    
-    # Get full conversation context
-    context = get_conversation_context(state.get("messages", []), max_messages=20)
-
-    followup_prompt = f"""You are Veda AI, a data analyst assistant. The user is asking a follow-up question about something you previously discussed or calculated.
-
-FULL CONVERSATION HISTORY:
-{context}
-
-CURRENT FOLLOW-UP QUESTION: "{state['query']}"
-
-Your task is to EXPLAIN and CLARIFY based on what was discussed before. 
-
-If the user asks about how a criticality score or ranking was calculated, explain:
-1. The formula/methodology used
-2. The weights assigned to each parameter
-3. Why those parameters matter for machine criticality
-4. How to interpret the results
-
-For machine criticality scoring, the typical formula is:
-- Criticality Score = (Vibration × 0.25) + (Power Load × 0.25) + (Temperature/100 × 0.25) + (RPM/1000 × 0.25)
-- Higher scores indicate machines that need more attention
-- Vibration: High vibration often indicates wear or misalignment
-- Power Load: Higher load means the machine is working harder
-- Temperature: Elevated temps can indicate friction or cooling issues
-- RPM: Higher speeds can accelerate wear
-
-If the user asks about MTBF/MTTR:
-- MTBF (Mean Time Between Failures): Average time a machine runs before failing
-- MTTR (Mean Time To Repair): Average time to fix a machine after failure
-- Note: These metrics require failure/maintenance data which may not be in the current dataset
-
-Provide a clear, helpful explanation. Be conversational and reference the specific context of what was discussed.
-Don't generate new SQL or data - just explain what was already done.
-"""
-
-    response = llm.invoke([HumanMessage(content=followup_prompt)])
-    answer = response.content.strip()
-
-    return {
-        "final_response": {
-            "answer": answer,
-            "visualization": None,
-            "error": None,
-        },
-        "messages": [AIMessage(content=answer)],
-    }
-
-
-def generate_sql(state: AgentState) -> Dict[str, Any]:
-    """Generate SQL query based on user question and intent, learning from past errors."""
-    llm = get_llm()
-    
-    # Get conversation context for better understanding
-    context = get_conversation_context(state.get("messages", []))
-    
-    # Build error context if we have previous failures
-    error_context = ""
-    error_history = state.get("error_history") or []
-    if error_history:
-        error_context = "\n\nPREVIOUS FAILED ATTEMPTS (learn from these):\n"
-        for i, err in enumerate(error_history, 1):
-            error_context += f"""
-Attempt {i}:
-- SQL: {err.get('sql', 'N/A')}
-- Error: {err.get('error', 'N/A')}
-- Analysis: {err.get('analysis', 'N/A')}
-"""
-        error_context += "\nDO NOT repeat these mistakes. Generate a corrected query.\n"
-
-    # Check if this is a complex query that needs export (ranking, all rows, etc.)
-    query_lower = state['query'].lower()
-    needs_export = any(keyword in query_lower for keyword in [
-        'rank', 'all machines', 'all rows', 'csv', 'download', 'export',
-        'criticality', 'score', 'calculate', 'based on parameters'
-    ])
-
-    if state["intent"] == "analysis" and not needs_export:
-        sql_instructions = """Generate a SQL query that:
-- Uses aggregations (SUM, COUNT, AVG, GROUP BY)
-- Returns at most 100 rows
-- Is optimized for visualization
-- Returns data suitable for charts
-
-Return ONLY the SQL query, no explanation."""
-    else:
-        # For export or complex ranking queries
-        sql_instructions = """Generate a SQL query that:
-- Performs all calculations SERVER-SIDE in SQL (not in Python)
-- For ranking/scoring: Use window functions like RANK(), ROW_NUMBER(), or calculated columns
-- Include all relevant columns needed for the analysis
-- Use COALESCE for NULL handling
-- For criticality scoring, calculate a composite score using available metrics
-
-Example for machine criticality ranking:
-SELECT 
-    machine_id,
-    machine_name,
-    AVG(rpm) as avg_rpm,
-    AVG(power_load_kw) as avg_load,
-    AVG(vibration_mm_per_s) as avg_vibration,
-    COUNT(*) as total_records,
-    -- Criticality score (higher = more critical)
-    (COALESCE(AVG(vibration_mm_per_s), 0) * 0.3 + 
-     COALESCE(AVG(power_load_kw), 0) * 0.2 + 
-     COALESCE(AVG(temperature_celsius), 0) * 0.2 +
-     COALESCE(AVG(rpm), 0) / 100 * 0.3) as criticality_score
-FROM "General Machine 2000"
-GROUP BY machine_id, machine_name
-ORDER BY criticality_score DESC;
-
-Return ONLY the SQL query, no explanation."""
-
-    prompt = f"""{SYSTEM_PROMPT}
-
-Previous conversation context:
-{context}
-{error_context}
-Current User Question: {state['query']}
-
-{sql_instructions}
-"""
-
-    response = llm.invoke([HumanMessage(content=prompt)])
-    sql_query = response.content.strip()
-
-    # Clean up SQL (remove markdown code blocks if present)
-    if sql_query.startswith("```"):
-        sql_query = sql_query.split("```")[1]
-        if sql_query.startswith("sql"):
-            sql_query = sql_query[3:]
-        sql_query = sql_query.strip()
-
-    return {"sql_query": sql_query, "requires_export": needs_export}
-
-
-def validate_sql(state: AgentState) -> Dict[str, Any]:
-    """Validate SQL query syntax and structure before execution."""
-    sql_query = state["sql_query"]
-    
-    # First, validate SQL syntax using EXPLAIN
-    validation_result = validate_sql_syntax(sql_query)
-    
-    if validation_result.get("error"):
-        # SQL has syntax errors - record for retry
-        error_history = state.get("error_history") or []
-        error_history.append({
-            "sql": sql_query,
-            "error": validation_result["error"],
-            "analysis": "SQL syntax validation failed before execution"
-        })
-        return {
-            "error": validation_result["error"],
-            "error_history": error_history,
-            "retry_count": state.get("retry_count", 0) + 1
-        }
-    
-    # For analysis queries without export flag, ensure aggregation or limit
-    if state["intent"] == "analysis" and not state.get("requires_export"):
-        sql_upper = sql_query.upper()
-        has_aggregation = any(
-            agg in sql_upper
-            for agg in ["SUM(", "COUNT(", "AVG(", "MIN(", "MAX(", "GROUP BY", "RANK(", "ROW_NUMBER("]
-        )
-
-        if not has_aggregation and "LIMIT" not in sql_upper:
-            sql_query = sql_query.rstrip(";") + " LIMIT 100;"
-
-    return {"sql_query": sql_query, "error": None}
-
-
-def execute_analysis_query(state: AgentState) -> Dict[str, Any]:
-    """Execute SQL for analysis and store results with intelligent error handling."""
-    sql_query = state["sql_query"]
-    
-    # If this requires export (complex ranking, all machines, etc.), route to export
-    if state.get("requires_export"):
-        result = export_large_dataset(sql_query)
-        
-        if "error" in result and result.get("error"):
-            # Record error for learning
-            error_history = state.get("error_history") or []
-            error_history.append({
-                "sql": sql_query,
-                "error": result["error"],
-                "analysis": analyze_sql_error(result["error"], sql_query)
-            })
-            
-            if state.get("retry_count", 0) < 3:
-                return {
-                    "error": result["error"],
-                    "error_history": error_history,
-                    "retry_count": state.get("retry_count", 0) + 1,
-                }
-            return {"error": result["error"], "query_result": None, "error_history": error_history}
-        
-        # Success - return download URL
-        answer = f"I've calculated the machine rankings based on the parameters you specified. The dataset contains {result['row_count']:,} rows with criticality scores. You can download it using the link below (valid for 1 hour)."
-        
-        return {
-            "final_response": {
-                "answer": answer,
-                "download_url": result["download_url"],
-                "visualization": None,
-            },
-            "messages": [AIMessage(content=answer)],
-            "error": None,
-        }
-    
-    # Standard analysis query
-    result = query_aggregate_data(sql_query)
-
-    if "error" in result and result.get("error"):
-        # Record error with analysis for learning
-        error_history = state.get("error_history") or []
-        error_history.append({
-            "sql": sql_query,
-            "error": result["error"],
-            "analysis": analyze_sql_error(result["error"], sql_query)
-        })
-        
-        if state.get("retry_count", 0) < 3:
-            return {
-                "error": result["error"],
-                "error_history": error_history,
-                "retry_count": state.get("retry_count", 0) + 1,
-            }
-        return {"error": result["error"], "query_result": None, "error_history": error_history}
-
-    return {"query_result": result["data"], "error": None}
-
-
-def analyze_sql_error(error: str, sql: str) -> str:
-    """Analyze SQL error to provide guidance for retry."""
-    error_lower = error.lower()
-    
-    if "column" in error_lower and "does not exist" in error_lower:
-        return "Column name is incorrect. Check the schema for exact column names. Remember table is 'General Machine 2000' with columns like machine_id, machine_name, rpm, vibration_mm_per_s, power_load_kw, temperature_celsius, etc."
-    
-    if "relation" in error_lower and "does not exist" in error_lower:
-        return "Table name is incorrect. Use exact name: \"General Machine 2000\" (with quotes and spaces)."
-    
-    if "syntax error" in error_lower:
-        return "SQL syntax error. Check for missing commas, parentheses, or incorrect keywords."
-    
-    if "division by zero" in error_lower:
-        return "Division by zero. Use NULLIF or COALESCE to handle zero values."
-    
-    if "too many rows" in error_lower:
-        return "Query returns too many rows. Add GROUP BY aggregation or use export flow for large datasets."
-    
-    if "permission" in error_lower or "denied" in error_lower:
-        return "Permission issue. Ensure query only accesses allowed tables."
-    
-    return f"Execution failed. Review the SQL structure and try a simpler approach."
-
-
-def execute_export_query(state: AgentState) -> Dict[str, Any]:
-    """Execute SQL for export and upload to storage."""
-    result = export_large_dataset(state["sql_query"])
-
-    if "error" in result:
-        return {"error": result["error"]}
-
-    answer = f"I've prepared your dataset with {result['row_count']:,} rows. You can download it using the link below (valid for 1 hour)."
-    
-    return {
-        "final_response": {
-            "answer": answer,
-            "download_url": result["download_url"],
-            "visualization": None,
-        },
-        "messages": [AIMessage(content=answer)],
-    }
-
-
-def format_analysis_response(state: AgentState) -> Dict[str, Any]:
-    """Format query results into structured response with visualization data."""
-    # If we already have a final response (from export), just return it
-    if state.get("final_response"):
-        return {}
-    
-    if state.get("error"):
-        # Include error history in the response for debugging
-        error_history = state.get("error_history") or []
-        error_details = state['error']
-        if error_history:
-            error_details += f" (Attempted {len(error_history)} times)"
-        
-        answer = f"I encountered an error while processing your request: {error_details}. Please try rephrasing your question or simplifying the query."
-        return {
-            "final_response": {
-                "answer": answer,
-                "visualization": None,
-                "error": state["error"],
-            },
-            "messages": [AIMessage(content=answer)],
-        }
-
-    llm = get_llm()
-    data = state["query_result"]
-    context = get_conversation_context(state.get("messages", []))
-
-    format_prompt = f"""Based on this data and the user's question, create a response.
-
-Previous conversation:
-{context}
-
-User Question: {state['query']}
-SQL Query: {state['sql_query']}
-Data (first 10 rows): {json.dumps(data[:10] if data else [], default=str)}
-Total rows: {len(data) if data else 0}
-
-Respond with a JSON object containing:
-1. "answer": A natural language insight/summary (2-3 sentences). Be conversational and reference the user by name if known.
-2. "chart_type": One of "bar", "line", "pie", or "table"
-3. "labels": Array of x-axis labels (from the data)
-4. "datasets": Array of objects with "label" (string) and "data" (array of numbers)
-
-Rules for chart selection:
-- LINE: Time-series data (dates on x-axis)
-- BAR: Categorical comparisons
-- PIE: Distribution/percentages (max 8 items)
-- TABLE: When visualization doesn't make sense
-
-Return ONLY valid JSON, no markdown or explanation.
-"""
-
-    response = llm.invoke([HumanMessage(content=format_prompt)])
-
-    try:
-        content = response.content.strip()
-        if content.startswith("```"):
-            content = content.split("```")[1]
-            if content.startswith("json"):
-                content = content[4:]
-            content = content.strip()
-
-        parsed = json.loads(content)
-
-        visualization = {
-            "type": parsed.get("chart_type", "table"),
-            "labels": parsed.get("labels", []),
-            "datasets": parsed.get("datasets", []),
-        }
-        answer = parsed.get("answer", "Here are the results.")
-
-        return {
-            "final_response": {
-                "answer": answer,
-                "visualization": visualization,
-                "error": None,
-            },
-            "messages": [AIMessage(content=answer)],
-        }
-    except Exception:
-        answer = f"Here are the query results ({len(data) if data else 0} rows)."
-        return {
-            "final_response": {
-                "answer": answer,
-                "visualization": {
-                    "type": "table",
-                    "labels": list(data[0].keys()) if data else [],
-                    "datasets": [{"label": "Results", "data": data[:50] if data else []}],
-                },
-                "error": None,
-            },
-            "messages": [AIMessage(content=answer)],
-        }
-
-
-def handle_retry(state: AgentState) -> Dict[str, Any]:
-    """Handle SQL retry with error memory - learns from past failures."""
-    llm = get_llm()
-    
-    # Build comprehensive error history context
-    error_history = state.get("error_history") or []
-    error_context = ""
-    if error_history:
-        error_context = "\n=== PREVIOUS FAILED ATTEMPTS (DO NOT REPEAT THESE MISTAKES) ===\n"
-        for i, err in enumerate(error_history, 1):
-            error_context += f"""
---- Attempt {i} ---
-SQL Query: {err.get('sql', 'N/A')}
-Error: {err.get('error', 'N/A')}
-Analysis: {err.get('analysis', 'N/A')}
-"""
-        error_context += "\n=== END OF ERROR HISTORY ===\n"
-
-    retry_prompt = f"""You are fixing a failed SQL query. Learn from the previous errors and generate a CORRECT query.
-
-{error_context}
-
-CURRENT ERROR: {state['error']}
-FAILED QUERY: {state['sql_query']}
-
-ORIGINAL USER QUESTION: {state['query']}
-
-{SYSTEM_PROMPT}
-
-IMPORTANT RULES FOR RETRY:
-1. The table name MUST be quoted: "General Machine 2000"
-2. Use exact column names from schema: machine_id, machine_name, rpm, vibration_mm_per_s, power_load_kw, temperature_celsius, humidity_percent, speed_m_per_min, pressure_bar, qty, date, order_number, product_name
-3. Use COALESCE for NULL handling in calculations
-4. For ranking/scoring, calculate everything in SQL using window functions or computed columns
-5. If the query is complex (ranking all machines), it will be exported to CSV automatically
-
-Generate a CORRECTED SQL query. Return ONLY the SQL, no explanation.
-"""
-
-    response = llm.invoke([HumanMessage(content=retry_prompt)])
-    sql_query = response.content.strip()
-
-    if sql_query.startswith("```"):
-        sql_query = sql_query.split("```")[1]
-        if sql_query.startswith("sql"):
-            sql_query = sql_query[3:]
-        sql_query = sql_query.strip()
-
-    return {"sql_query": sql_query, "error": None}
-
-
-# ============== ROUTING FUNCTIONS ==============
-
-def route_by_intent(state: AgentState) -> Literal["greeting", "followup", "analysis", "export"]:
-    """Route to greeting, followup, analysis, or export flow based on intent."""
-    return state["intent"]
-
-
-def should_retry(state: AgentState) -> Literal["retry", "format", "end"]:
-    """Determine if we should retry, format results, or end with error."""
-    # Check if we already have a final response (from export success)
-    if state.get("final_response"):
-        return "end"
-    if state.get("error") and state.get("retry_count", 0) < 3:
-        return "retry"
-    elif state.get("error"):
-        return "end"
-    return "format"
-
-
-def route_after_validation(state: AgentState) -> Literal["analysis", "export", "retry"]:
-    """Route after SQL validation - check for validation errors first."""
-    # If validation found errors, go to retry
-    if state.get("error"):
-        return "retry"
-    return "export" if state["intent"] == "export" else "analysis"
-
-
-# ============== BUILD THE GRAPH WITH MEMORY ==============
-
-def create_agent_graph():
-    """Create and compile the LangGraph agent with memory."""
-
-    workflow = StateGraph(AgentState)
-
-    # Add nodes
-    workflow.add_node("classify_intent", classify_intent)
-    workflow.add_node("handle_greeting", handle_greeting)
-    workflow.add_node("handle_followup", handle_followup)
-    workflow.add_node("generate_sql", generate_sql)
-    workflow.add_node("validate_sql", validate_sql)
-    workflow.add_node("execute_analysis", execute_analysis_query)
-    workflow.add_node("execute_export", execute_export_query)
-    workflow.add_node("format_response", format_analysis_response)
-    workflow.add_node("handle_retry", handle_retry)
-
-    # Set entry point
-    workflow.set_entry_point("classify_intent")
-
-    # Conditional routing after intent classification
-    workflow.add_conditional_edges(
-        "classify_intent",
-        route_by_intent,
-        {
-            "greeting": "handle_greeting",
-            "followup": "handle_followup",
-            "analysis": "generate_sql",
-            "export": "generate_sql",
-        },
+    agent = create_react_agent(
+        model=model,
+        tools=tools,
+        prompt=SYSTEM_PROMPT,
+        checkpointer=memory,
     )
-
-    # Greeting and followup flows end directly
-    workflow.add_edge("handle_greeting", END)
-    workflow.add_edge("handle_followup", END)
-
-    # SQL generation flows to validation
-    workflow.add_edge("generate_sql", "validate_sql")
-
-    # Conditional routing after validation - includes retry path for validation errors
-    workflow.add_conditional_edges(
-        "validate_sql",
-        route_after_validation,
-        {
-            "analysis": "execute_analysis",
-            "export": "execute_export",
-            "retry": "handle_retry",
-        },
-    )
-
-    # Export flow ends directly
-    workflow.add_edge("execute_export", END)
-
-    # Analysis flow with retry logic
-    workflow.add_conditional_edges(
-        "execute_analysis",
-        should_retry,
-        {
-            "retry": "handle_retry",
-            "format": "format_response",
-            "end": END,
-        },
-    )
-
-    workflow.add_edge("handle_retry", "execute_analysis")
-    workflow.add_edge("format_response", END)
-
-    # Compile with memory checkpointer
-    checkpointer = InMemorySaver()
-    return workflow.compile(checkpointer=checkpointer)
-
-
-# Create the compiled graph with memory
-agent = create_agent_graph()
-
-
-def generate_helpful_error_message(query: str, error: str, error_history: list, retry_count: int) -> str:
-    """Generate a helpful, user-friendly error message explaining why the request failed."""
-    llm = get_llm()
     
-    # Build error context
-    error_summary = ""
-    if error_history:
-        error_summary = "I tried the following approaches:\n"
-        for i, err in enumerate(error_history, 1):
-            error_summary += f"- Attempt {i}: {err.get('analysis', err.get('error', 'Unknown error'))}\n"
-    
-    prompt = f"""You are Veda AI. The user asked a question but you couldn't fulfill it after {retry_count} attempts.
+    print(f"[AGENT] Created with model: {model_name}, streaming enabled")
+    return agent
 
-USER'S QUESTION: "{query}"
 
-FINAL ERROR: {error}
+# Global agent instance
+agent = create_agent()
 
-{error_summary}
 
-Generate a helpful, friendly response that:
-1. Apologizes for not being able to help
-2. Explains WHY you couldn't complete the request (in simple terms)
-3. Suggests what the user could do differently or what data might be missing
-4. Offers alternative questions they could ask
-
-Common reasons for failure:
-- The requested data/columns don't exist in the database (e.g., "breakdown logs", "failure history", "MTBF", "MTTR" - these require maintenance tracking data)
-- The query was too complex for the available data
-- The table only contains: machine_id, machine_name, order_number, product_name, qty, date, temperature_celsius, humidity_percent, speed_m_per_min, vibration_mm_per_s, rpm, pressure_bar, power_load_kw
-
-Be conversational and helpful. Don't be technical about SQL errors.
-Keep the response concise (3-4 sentences max).
-"""
-
-    response = llm.invoke([HumanMessage(content=prompt)])
-    return response.content.strip()
-
+# =============================================================================
+# SYNCHRONOUS EXECUTION (for non-streaming endpoint)
+# =============================================================================
 
 def run_agent(query: str, thread_id: str = "default") -> Dict[str, Any]:
-    """Run the agent with a user query and conversation memory."""
-    
-    # Config with thread_id for memory persistence
+    """Run the agent synchronously and return final result."""
     config = {"configurable": {"thread_id": thread_id}}
     
-    # Input state - add user message to conversation with error tracking
-    input_state = {
-        "messages": [HumanMessage(content=query)],
-        "query": query,
-        "intent": None,
-        "sql_query": None,
-        "query_result": None,
-        "final_response": None,
-        "error": None,
-        "retry_count": 0,
-        "error_history": [],  # Track errors for learning
-        "requires_export": False,  # Flag for export queries
-    }
-
-    # Invoke with config for memory
-    result = agent.invoke(input_state, config=config)
-
-    if result.get("final_response"):
-        return result["final_response"]
-    elif result.get("error"):
-        # Generate a helpful error message using LLM
-        error_history = result.get("error_history", [])
-        retry_count = result.get("retry_count", 0)
-        helpful_message = generate_helpful_error_message(
-            query=query,
-            error=result["error"],
-            error_history=error_history,
-            retry_count=retry_count
+    try:
+        result = agent.invoke(
+            {"messages": [HumanMessage(content=query)]},
+            config=config
         )
+        
+        messages = result.get("messages", [])
+        
+        # Extract final response
+        response_text = ""
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and msg.content:
+                response_text = msg.content
+                break
+        
+        if not response_text:
+            response_text = "I couldn't generate a response. Please try again."
+        
+        # Extract visualization and download URL from tool messages
+        visualization = None
+        download_url = None
+        
+        for msg in messages:
+            if isinstance(msg, ToolMessage):
+                try:
+                    data = json.loads(msg.content)
+                    if data.get("download_url"):
+                        download_url = data["download_url"]
+                    elif data.get("data") and data.get("success"):
+                        visualization = build_visualization(data["data"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        
         return {
-            "answer": helpful_message,
-            "visualization": None,
-            "error": result["error"],
+            "answer": response_text,
+            "visualization": visualization,
+            "download_url": download_url,
+            "error": None
         }
-    else:
-        # No response and no error - generate explanation
-        helpful_message = generate_helpful_error_message(
-            query=query,
-            error="The analysis completed but produced no results",
-            error_history=[],
-            retry_count=0
-        )
+        
+    except Exception as e:
         return {
-            "answer": helpful_message,
+            "answer": f"Error: {str(e)}",
             "visualization": None,
-            "error": "No response generated",
+            "download_url": None,
+            "error": str(e)
         }
 
 
-# Node name to user-friendly step mapping
-NODE_STEPS = {
-    "classify_intent": {"step": "Understanding your question", "icon": "🧠"},
-    "handle_greeting": {"step": "Preparing response", "icon": "💬"},
-    "handle_followup": {"step": "Explaining methodology", "icon": "💡"},
-    "generate_sql": {"step": "Generating database query", "icon": "📝"},
-    "validate_sql": {"step": "Validating query", "icon": "✅"},
-    "execute_analysis": {"step": "Executing analysis", "icon": "⚡"},
-    "execute_export": {"step": "Preparing export", "icon": "📦"},
-    "format_response": {"step": "Formatting results", "icon": "📊"},
-    "handle_retry": {"step": "Retrying query", "icon": "🔄"},
-}
+# =============================================================================
+# STREAMING EXECUTION (Cursor-style real-time updates)
+# =============================================================================
 
-
-async def run_agent_stream(query: str, thread_id: str = "default"):
+async def run_agent_stream(query: str, thread_id: str = "default") -> AsyncGenerator[Dict[str, Any], None]:
     """
-    Run the agent with streaming updates.
-    Yields events as the agent progresses through nodes.
+    Stream agent execution with real-time updates.
+    
+    Yields events in this format:
+    - {"type": "thinking", "content": "..."} - Agent's reasoning
+    - {"type": "tool_call", "tool": "...", "sql": "..."} - Tool being called
+    - {"type": "tool_result", "tool": "...", "data": {...}} - Tool result
+    - {"type": "token", "content": "..."} - Streaming token from LLM
+    - {"type": "message", "content": "..."} - Complete message chunk
+    - {"type": "visualization", "data": {...}} - Chart data
+    - {"type": "download", "url": "..."} - CSV download URL
+    - {"type": "done", "answer": "..."} - Final complete response
+    - {"type": "error", "message": "..."} - Error occurred
     """
     import asyncio
-
+    
     config = {"configurable": {"thread_id": thread_id}}
-
-    input_state = {
-        "messages": [HumanMessage(content=query)],
-        "query": query,
-        "intent": None,
-        "sql_query": None,
-        "query_result": None,
-        "final_response": None,
-        "error": None,
-        "retry_count": 0,
-        "error_history": [],
-        "requires_export": False,
-    }
-
-    # Stream with updates mode to get node-by-node progress
-    final_result = None
-
-    for event in agent.stream(input_state, config=config, stream_mode="updates"):
-        for node_name, node_output in event.items():
-            # Get user-friendly step info
-            step_info = NODE_STEPS.get(node_name, {"step": node_name, "icon": "⏳"})
-
-            # Yield progress event
-            yield {
-                "type": "progress",
-                "data": {
-                    "node": node_name,
-                    "step": step_info["step"],
-                    "icon": step_info["icon"],
-                },
-            }
-
-            # Check if we have intent info to share
-            if node_name == "classify_intent" and node_output.get("intent"):
-                yield {
-                    "type": "intent",
-                    "data": {"intent": node_output["intent"]},
-                }
-
-            # Check if we have the final response
-            if node_output.get("final_response"):
-                final_result = node_output["final_response"]
-
-            # Small delay to make streaming visible
-            await asyncio.sleep(0.1)
-
-    # Yield the final result
-    if final_result:
+    
+    # Track state for building final response
+    final_answer = ""
+    visualization_data = None
+    download_url = None
+    tool_results = []
+    
+    try:
+        # Stream with multiple modes for rich updates
+        async for stream_type, chunk in agent.astream(
+            {"messages": [HumanMessage(content=query)]},
+            config=config,
+            stream_mode=["messages", "updates", "custom"]
+        ):
+            
+            if stream_type == "messages":
+                # LLM token streaming
+                message_chunk, metadata = chunk
+                if hasattr(message_chunk, 'content') and message_chunk.content:
+                    yield {
+                        "type": "token",
+                        "content": message_chunk.content,
+                        "node": metadata.get("langgraph_node", "")
+                    }
+                    final_answer += message_chunk.content
+                
+                # Check for tool calls in the message
+                if hasattr(message_chunk, 'tool_calls') and message_chunk.tool_calls:
+                    for tc in message_chunk.tool_calls:
+                        yield {
+                            "type": "tool_call",
+                            "tool": tc.get("name", "unknown"),
+                            "args": tc.get("args", {})
+                        }
+            
+            elif stream_type == "updates":
+                # Node updates (agent reasoning, tool execution)
+                for node_name, node_data in chunk.items():
+                    if node_name == "agent":
+                        # Agent is thinking/responding
+                        messages = node_data.get("messages", [])
+                        for msg in messages:
+                            if isinstance(msg, AIMessage):
+                                if msg.content and not msg.tool_calls:
+                                    # Final response content
+                                    yield {
+                                        "type": "message",
+                                        "content": msg.content,
+                                        "node": "agent"
+                                    }
+                                    final_answer = msg.content
+                                elif msg.tool_calls:
+                                    # Agent decided to use a tool
+                                    for tc in msg.tool_calls:
+                                        yield {
+                                            "type": "thinking",
+                                            "content": f"I'll query the database to find this information..."
+                                        }
+                    
+                    elif node_name == "tools":
+                        # Tool execution completed
+                        messages = node_data.get("messages", [])
+                        for msg in messages:
+                            if isinstance(msg, ToolMessage):
+                                try:
+                                    result = json.loads(msg.content)
+                                    tool_results.append(result)
+                                    
+                                    if result.get("download_url"):
+                                        download_url = result["download_url"]
+                                        yield {
+                                            "type": "download",
+                                            "url": download_url,
+                                            "row_count": result.get("row_count", 0)
+                                        }
+                                    
+                                    if result.get("data") and result.get("success"):
+                                        viz = build_visualization(result["data"])
+                                        if viz:
+                                            visualization_data = viz
+                                            yield {
+                                                "type": "visualization",
+                                                "data": viz
+                                            }
+                                        
+                                        # Stream data summary
+                                        yield {
+                                            "type": "data_received",
+                                            "row_count": result.get("row_count", 0),
+                                            "preview": result["data"][:5] if result["data"] else []
+                                        }
+                                    
+                                    if result.get("error"):
+                                        yield {
+                                            "type": "tool_error",
+                                            "message": result["error"]
+                                        }
+                                        
+                                except (json.JSONDecodeError, TypeError):
+                                    pass
+            
+            elif stream_type == "custom":
+                # Custom tool progress updates
+                yield chunk
+            
+            await asyncio.sleep(0)  # Allow other tasks to run
+        
+        # Final done event with complete response
         yield {
-            "type": "result",
-            "data": final_result,
+            "type": "done",
+            "answer": final_answer,
+            "visualization": visualization_data,
+            "download_url": download_url
         }
-    else:
-        # Get the final state to check for errors
-        final_state = agent.get_state(config)
-        state_values = final_state.values if final_state else {}
         
-        error = state_values.get("error")
-        error_history = state_values.get("error_history", [])
-        retry_count = state_values.get("retry_count", 0)
-        
-        if error:
-            # Generate helpful error message
-            helpful_message = generate_helpful_error_message(
-                query=query,
-                error=error,
-                error_history=error_history,
-                retry_count=retry_count
-            )
-            yield {
-                "type": "result",
-                "data": {
-                    "answer": helpful_message,
-                    "visualization": None,
-                    "error": error,
-                },
-            }
+    except Exception as e:
+        yield {
+            "type": "error",
+            "message": str(e)
+        }
+
+
+# =============================================================================
+# VISUALIZATION BUILDER
+# =============================================================================
+
+def build_visualization(data: List[Dict]) -> Optional[Dict[str, Any]]:
+    """Build chart-ready data from query results."""
+    if not data or len(data) == 0:
+        return None
+    
+    first_row = data[0]
+    keys = list(first_row.keys())
+    
+    # Identify label column and numeric columns
+    label_col = None
+    numeric_cols = []
+    
+    for key in keys:
+        val = first_row.get(key)
+        if label_col is None and (isinstance(val, str) or val is None):
+            label_col = key
+        elif val is not None:
+            try:
+                float(val)
+                numeric_cols.append(key)
+            except (ValueError, TypeError):
+                if label_col is None:
+                    label_col = key
+    
+    if not label_col and keys:
+        label_col = keys[0]
+    
+    if not numeric_cols:
+        return None
+    
+    # Build chart data (max 20 items for readability)
+    max_items = 20
+    labels = []
+    for row in data[:max_items]:
+        val = row.get(label_col)
+        if val is None:
+            labels.append("(not recorded)")
         else:
-            # Fallback for truly unknown errors
-            yield {
-                "type": "result",
-                "data": {
-                    "answer": "I wasn't able to complete your request. This might be because the data you're looking for isn't available in the current dataset. Try asking about machine performance metrics like RPM, temperature, vibration, or power load.",
-                    "visualization": None,
-                    "error": "No response generated",
-                },
+            labels.append(str(val)[:40])  # Truncate long labels
+    
+    datasets = []
+    colors = [
+        "rgba(59, 130, 246, 0.8)",   # Blue
+        "rgba(16, 185, 129, 0.8)",   # Green  
+        "rgba(245, 158, 11, 0.8)",   # Amber
+        "rgba(239, 68, 68, 0.8)",    # Red
+        "rgba(139, 92, 246, 0.8)",   # Purple
+    ]
+    
+    for i, col in enumerate(numeric_cols[:5]):  # Max 5 datasets
+        values = []
+        for row in data[:max_items]:
+            try:
+                v = row.get(col)
+                values.append(round(float(v), 2) if v is not None else 0)
+            except (ValueError, TypeError):
+                values.append(0)
+        
+        datasets.append({
+            "label": col.replace('_', ' ').title(),
+            "data": values,
+            "backgroundColor": colors[i % len(colors)],
+            "borderColor": colors[i % len(colors)].replace("0.8", "1"),
+            "borderWidth": 1
+        })
+    
+    # Determine chart type based on data characteristics
+    chart_type = "bar"
+    
+    # Time series → line chart
+    if label_col and any(x in label_col.lower() for x in ['date', 'time', 'month', 'year', 'day', 'week']):
+        chart_type = "line"
+        for ds in datasets:
+            ds["fill"] = False
+            ds["tension"] = 0.1
+    
+    # Few items with single metric → pie chart
+    elif len(data) <= 8 and len(numeric_cols) == 1:
+        chart_type = "pie"
+        datasets[0]["backgroundColor"] = colors[:len(data)]
+    
+    return {
+        "type": chart_type,
+        "labels": labels,
+        "datasets": datasets,
+        "options": {
+            "responsive": True,
+            "plugins": {
+                "legend": {"position": "top"},
+                "title": {"display": False}
             }
+        }
+    }
